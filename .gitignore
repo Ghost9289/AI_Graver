@@ -1,0 +1,22 @@
+__pycache__/
+build/
+dist/
+installer/
+output/
+dataset/
+synthetic_portrait.png
+settings.ini
+
+# stale nested copy left over from the original zip extraction, not part of the app
+AI_Graver_v0.1/
+AI_Graver_v0.1.zip
+
+# large model files: downloaded in CI from a GitHub Release asset (see PUBLISH_RELEASE.md)
+# instead of being committed, since GitHub blocks plain git pushes over 100MB.
+# Only the small models needed for the build stay tracked (FSRCNN_x4.pb, selfie_segmenter.tflite).
+models/GFPGANv1.4.onnx
+models/RealESRGAN_x4plus.onnx
+models/RestoreFormerPlusPlus.onnx
+models/gpen_bfr_512.onnx
+models/gpen_bfr_256.onnx
+models/gpen_bfr_256.hash

@@ -1,0 +1,47 @@
+name: Build Windows release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install build tools
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt pyinstaller
+          choco install innosetup --no-progress --yes
+      - name: Set release version
+        shell: pwsh
+        run: |
+          $version = $env:GITHUB_REF_NAME.TrimStart('v')
+          @(
+            "APP_VERSION = `"$version`""
+            'UPDATE_REPOSITORY = "Ghost9289/AI_Graver"'
+          ) | Set-Content version.py -Encoding utf8
+          "AI_GRAVER_VERSION=$version" | Out-File -FilePath $env:GITHUB_ENV -Append
+      - name: Download face-restoration model
+        shell: pwsh
+        run: |
+          Invoke-WebRequest -Uri "https://github.com/Ghost9289/AI_Graver/releases/download/models-v1/GFPGANv1.4.onnx" -OutFile "models\GFPGANv1.4.onnx"
+      - name: Build application
+        run: python -m PyInstaller --noconfirm --clean AI_Graver.spec
+      - name: Build installer
+        shell: pwsh
+        run: '& "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" "/DMyAppVersion=$env:AI_GRAVER_VERSION" installer.iss'
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $asset = (Get-ChildItem installer\AI_Graver_Setup_v*.exe | Select-Object -First 1).FullName
+          gh release create $env:GITHUB_REF_NAME $asset --generate-notes

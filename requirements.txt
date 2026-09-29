@@ -1,0 +1,5 @@
+Pillow>=10.0
+numpy>=2.0,<2.3
+opencv-contrib-python-headless>=4.12,<5
+mediapipe==0.10.35
+onnxruntime>=1.22,<2

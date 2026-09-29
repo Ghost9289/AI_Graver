@@ -1,0 +1,2 @@
+APP_VERSION = "0.7.0"
+UPDATE_REPOSITORY = "Ghost9289/AI_Graver"
