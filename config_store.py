@@ -19,6 +19,8 @@ class AppSettings:
     stone_profile: str = "black_granite"
     enhance_4k: bool = True
     restoration_mode: str = "natural"
+    openai_api_key: str = ""
+    openai_model: str = "gpt-image-1"
 
 
 def load_settings(path: Path) -> AppSettings:
@@ -45,6 +47,8 @@ def load_settings(path: Path) -> AppSettings:
         stone_profile=str(section.get("stone_profile", "black_granite")),
         enhance_4k=str(section.get("enhance_4k", "true")).lower() == "true",
         restoration_mode=restoration_mode,
+        openai_api_key=str(section.get("openai_api_key", "")).strip(),
+        openai_model=str(section.get("openai_model", "gpt-image-1")).strip() or "gpt-image-1",
     )
 
 
@@ -63,6 +67,8 @@ def save_settings(path: Path, settings: AppSettings) -> None:
         "stone_profile": settings.stone_profile,
         "enhance_4k": str(settings.enhance_4k).lower(),
         "restoration_mode": settings.restoration_mode,
+        "openai_api_key": settings.openai_api_key,
+        "openai_model": settings.openai_model,
     }
     with path.open("w", encoding="utf-8") as file:
         parser.write(file)

@@ -4,12 +4,15 @@ import os
 import queue
 import subprocess
 import threading
+import time
 import tkinter as tk
+from dataclasses import replace
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 
 from PIL import Image, ImageOps, ImageTk
 
+from ai_retouch import AIRetouchError, find_codex, load_template, retouch_with_openai
 from config_store import AppSettings, load_settings, save_settings
 from graver_bridge import launch_graver_with_image
 from processor import TARGET_DPI, EngravingOptions, ProcessingError, process_portrait, render_preview
@@ -21,6 +24,9 @@ APP_DIR = Path(__file__).resolve().parent
 DATA_DIR = Path(os.environ.get("APPDATA", str(Path.home()))) / "AI Graver"
 SETTINGS_PATH = DATA_DIR / "settings.ini"
 OUTPUT_DIR = DATA_DIR / "output"
+AI_CACHE_DIR = DATA_DIR / "ai_cache"
+AI_TEMPLATE_PATH = DATA_DIR / "ai_template.txt"
+AI_ERROR_LOG = DATA_DIR / "logs" / "ai_errors.log"
 STONE_LABELS = {
     "Чёрный гранит / Карелия": "black_granite",
     "Серый гранит": "gray_granite",
@@ -87,6 +93,8 @@ class AIGraverApp(tk.Tk):
         self.source_path: Path | None = None
         self.restored_path: Path | None = None
         self.result_path: Path | None = None
+        # AI retouch result per source photo: previews and re-processing reuse it instead of the original.
+        self.ai_results: dict[Path, Path] = {}
         self.message_queue: queue.Queue[tuple[str, object]] = queue.Queue()
         self.original_preview: ImageTk.PhotoImage | None = None
         self.result_preview: ImageTk.PhotoImage | None = None
@@ -312,7 +320,7 @@ class AIGraverApp(tk.Tk):
         stone_picker = ttk.Combobox(stone_row, textvariable=self.stone_profile, values=list(STONE_LABELS), state="readonly", width=20, font=(font, 8))
         stone_picker.pack(side="right")
         stone_picker.bind("<<ComboboxSelected>>", lambda _event: self._schedule_preview(delay=50))
-        ttk.Checkbutton(sidebar, text="AI-реконструкция лица + микродетали + 4K", variable=self.enhance_4k, style="Modern.TCheckbutton", command=self._schedule_preview).pack(anchor="w", pady=(4, 0))
+        ttk.Checkbutton(sidebar, text="AI-ретушь (ChatGPT) + лицо + 4K", variable=self.enhance_4k, style="Modern.TCheckbutton", command=self._schedule_preview).pack(anchor="w", pady=(4, 0))
         restoration_picker = ttk.Combobox(sidebar, textvariable=self.restoration_mode, values=list(RESTORATION_LABELS), state="readonly", width=26, font=(font, 8))
         restoration_picker.pack(fill="x", pady=(3, 0))
         restoration_picker.bind("<<ComboboxSelected>>", lambda _event: self._schedule_preview(delay=50))
@@ -469,7 +477,7 @@ class AIGraverApp(tk.Tk):
             return
         self.process_button.state(["disabled"])
         if self.enhance_4k.get():
-            self.status.set("AI восстанавливает лицо и весь портрет до 4K — это займёт около 1–2 минут…")
+            self.status.set("AI-ретушь через ChatGPT — обычно 1–3 минуты, затем подготовка 4K…")
         else:
             self.status.set("Обработка изображения…")
         options = EngravingOptions(
@@ -483,7 +491,8 @@ class AIGraverApp(tk.Tk):
             enhance_4k=self.enhance_4k.get(),
             restoration_mode=RESTORATION_LABELS.get(self.restoration_mode.get(), "natural"),
         )
-        thread = threading.Thread(target=self._run_processing, args=(self.source_path, options), daemon=True)
+        ai_access = self._ai_access() if options.enhance_4k else None
+        thread = threading.Thread(target=self._run_processing, args=(self.source_path, options, ai_access), daemon=True)
         thread.start()
 
     def _on_slider_change(self, variable: tk.IntVar, value: str) -> None:
@@ -520,7 +529,11 @@ class AIGraverApp(tk.Tk):
             enhance_4k=self.enhance_4k.get(),
             restoration_mode=RESTORATION_LABELS.get(self.restoration_mode.get(), "natural"),
         )
-        thread = threading.Thread(target=self._run_preview, args=(revision, self.source_path, options), daemon=True)
+        source = self.source_path
+        ai_result = self.ai_results.get(source) if options.enhance_4k else None
+        if ai_result and ai_result.is_file():
+            source, options = ai_result, replace(options, ai_retouched=True)
+        thread = threading.Thread(target=self._run_preview, args=(revision, source, options), daemon=True)
         thread.start()
 
     def _run_preview(self, revision: int, source: Path, options: EngravingOptions) -> None:
@@ -563,10 +576,45 @@ class AIGraverApp(tk.Tk):
         if not self.update_banner.winfo_ismapped():
             self.update_banner.pack(fill="x", pady=(16, 0), before=self.actions_card)
 
-    def _run_processing(self, source: Path, options: EngravingOptions) -> None:
+    def _ai_access(self) -> dict | None:
+        keys = [self.settings.openai_api_key, os.environ.get("OPENAI_API_KEY", "")]
+        keys = list(dict.fromkeys(key.strip() for key in keys if key and key.strip()))
+        if not keys and not find_codex():
+            self._log_ai_problem("нет ни Codex (вход через ChatGPT), ни ключа OpenAI API")
+            return None
+        return {"api_keys": keys, "model": self.settings.openai_model}
+
+    def _log_ai_problem(self, text: str) -> None:
+        try:
+            AI_ERROR_LOG.parent.mkdir(parents=True, exist_ok=True)
+            with AI_ERROR_LOG.open("a", encoding="utf-8") as file:
+                file.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} {text}\n")
+        except OSError:
+            pass
+
+    def _run_processing(self, source: Path, options: EngravingOptions, ai_access: dict | None = None) -> None:
+        original = source
+        ai_used = False
+        if ai_access:
+            try:
+                stem = "".join(char if char.isalnum() or char in "-_" else "_" for char in source.stem) or "portrait"
+                source = retouch_with_openai(
+                    source,
+                    OUTPUT_DIR / f"{stem}_ai.png",
+                    ai_access["api_keys"],
+                    load_template(AI_TEMPLATE_PATH),
+                    AI_CACHE_DIR,
+                    ai_access["model"],
+                )
+                options = replace(options, ai_retouched=True)
+                ai_used = True
+                self.message_queue.put(("ai_ready", (original, source)))
+            except AIRetouchError as error:
+                self._log_ai_problem(str(error))
+                self.message_queue.put(("ai_error", error))
         try:
             result = process_portrait(source, OUTPUT_DIR, options)
-            self.message_queue.put(("done", result))
+            self.message_queue.put(("done", (result, ai_used)))
         except Exception as error:  # display full processing errors in GUI
             self.message_queue.put(("error", error))
 
@@ -597,16 +645,24 @@ class AIGraverApp(tk.Tk):
                         self.status.set(str(error))
                     else:
                         self.after(700, self.destroy)
+                elif kind == "ai_ready":
+                    original, retouched = payload  # type: ignore[misc]
+                    self.ai_results[original] = retouched
+                    self._show_preview(retouched, self.source_label, "original")
+                    self.status.set("AI-ретушь готова — готовлю 4K и файл для Graver…")
+                elif kind == "ai_error":
+                    self.status.set("AI-ретушь недоступна — восстанавливаю лицо локально (GFPGAN), 1–3 минуты…")
                 elif kind == "done":
                     self.process_button.state(["!disabled"])
-                    self.result_path = payload  # type: ignore[assignment]
+                    self.result_path, ai_used = payload  # type: ignore[misc]
                     restored_path = self.result_path.with_name(self.result_path.name.replace("_graver_ready.png", "_restored_4k.png"))
                     if restored_path.is_file():
                         self.restored_path = restored_path
                         self._show_preview(self.restored_path, self.source_label, "original")
                     self._show_preview(self.result_path, self.result_label, "result")
                     self._update_result_actions_state()
-                    self.status.set("Готово. Слева показано улучшенное цветное 4K, справа — ретушь для Graver. Двойной щелчок открывает полный размер.")
+                    method = "AI-ретушь ChatGPT" if ai_used else ("локальный GFPGAN" if self.enhance_4k.get() else "без AI")
+                    self.status.set(f"Готово ({method}). Слева — улучшенное 4K, справа — для Graver. Двойной щелчок — полный размер.")
                     if self.auto_mode.get() and Path(self.graver_exe.get().strip()).is_file():
                         self.after(250, self._launch_graver)
                 elif kind == "preview":
@@ -691,6 +747,8 @@ class AIGraverApp(tk.Tk):
                 stone_profile=STONE_LABELS.get(self.stone_profile.get(), "black_granite"),
                 enhance_4k=self.enhance_4k.get(),
                 restoration_mode=RESTORATION_LABELS.get(self.restoration_mode.get(), "natural"),
+                openai_api_key=self.settings.openai_api_key,
+                openai_model=self.settings.openai_model,
             ),
         )
         self.destroy()

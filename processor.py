@@ -8,7 +8,7 @@ import threading
 
 import cv2
 import numpy as np
-from PIL import Image, ImageDraw, ImageEnhance, ImageFilter, ImageOps, UnidentifiedImageError
+from PIL import Image, ImageEnhance, ImageFilter, ImageOps, UnidentifiedImageError
 
 
 TARGET_SIZE = (3084, 5526)
@@ -21,10 +21,14 @@ _SEGMENTER = None
 _SEGMENTER_LOCK = threading.Lock()
 _FACE_RESTORER = None
 _FACE_RESTORER_SIZE = 512
-_FACE_RESTORER_KIND = "gfpgan"
 _FACE_RESTORER_LOCK = threading.Lock()
 _SUPER_RESOLVER = None
 _SUPER_RESOLVER_LOCK = threading.Lock()
+# Eye, eye, nose tip, mouth corner, mouth corner of an FFHQ-aligned 512px face (the GFPGAN/GPEN training layout).
+_FFHQ_TEMPLATE_512 = np.array(
+    [[192.98138, 239.94708], [318.90277, 240.1936], [256.63416, 314.01935], [201.26117, 371.41043], [313.08905, 371.15118]],
+    dtype=np.float32,
+)
 
 
 class ProcessingError(RuntimeError):
@@ -42,6 +46,8 @@ class EngravingOptions:
     stone_profile: str = "black_granite"
     enhance_4k: bool = True
     restoration_mode: str = "natural"
+    # The source is already an AI retouch (Codex/OpenAI): skip the local face model, it would only blur it.
+    ai_retouched: bool = False
 
 
 def process_portrait(source: Path, output_dir: Path, options: EngravingOptions) -> Path:
@@ -79,7 +85,8 @@ def _build_processed_image(
     face_resolution = _face_resolution(image)
     background_mask = _cached_background_mask(source, image, options.portrait_mode) if options.black_background else None
     if options.enhance_4k:
-        image = _cached_face_restoration(source, image, options.portrait_mode)
+        if not options.ai_retouched:
+            image = _cached_face_restoration(source, image, options.portrait_mode, options.restoration_mode)
         image = _enhance_source_resolution(image, target_size == TARGET_SIZE, options.restoration_mode)
 
     color_portrait = _fit_to_color_canvas(image, target_size)
@@ -230,25 +237,33 @@ def _super_resolve_portrait(image: Image.Image, target_size: tuple[int, int] = T
     return Image.fromarray(rgb, mode="RGB").filter(ImageFilter.UnsharpMask(radius=0.65, percent=42, threshold=3))
 
 
-def _cached_face_restoration(source: Path, image: Image.Image, portrait_mode: str) -> Image.Image:
+def _cached_face_restoration(source: Path, image: Image.Image, portrait_mode: str, restoration_mode: str) -> Image.Image:
     try:
         modified = source.stat().st_mtime_ns
     except OSError:
         modified = 0
-    key = (str(source.resolve()), modified, portrait_mode)
+    key = (str(source.resolve()), modified, f"{portrait_mode}:{restoration_mode}")
     cached = _RESTORED_IMAGE_CACHE.get(key)
     if cached is not None:
         return cached.copy()
-    restored = _restore_primary_face(image)
+    restored = _restore_primary_face(_suppress_print_noise(image, restoration_mode), restoration_mode)
     if len(_RESTORED_IMAGE_CACHE) >= 8:
         _RESTORED_IMAGE_CACHE.pop(next(iter(_RESTORED_IMAGE_CACHE)))
     _RESTORED_IMAGE_CACHE[key] = restored.copy()
     return restored
 
 
+def _suppress_print_noise(image: Image.Image, restoration_mode: str) -> Image.Image:
+    """Scanned prints carry film grain and halftone dots; detail enhancement would turn them into speckles."""
+    strength = {"strong": 5, "old_photo": 8}.get(restoration_mode)
+    if strength is None:
+        return image
+    denoised = cv2.fastNlMeansDenoisingColored(np.asarray(image.convert("RGB")), None, strength, strength, 7, 21)
+    return Image.fromarray(denoised, mode="RGB")
+
+
 def _get_face_restorer():
     global _FACE_RESTORER
-    global _FACE_RESTORER_KIND
     global _FACE_RESTORER_SIZE
     if _FACE_RESTORER is not None:
         return _FACE_RESTORER
@@ -257,7 +272,6 @@ def _get_face_restorer():
 
     model_path = _resource_path("models/GFPGANv1.4.onnx")
     if not model_path.is_file():
-        _FACE_RESTORER_KIND = "gpen"
         model_path = _resource_path("models/gpen_bfr_512.onnx")
         if not model_path.is_file():
             model_path = _resource_path("models/gpen_bfr_256.onnx")
@@ -275,90 +289,70 @@ def _get_face_restorer():
     return _FACE_RESTORER
 
 
-def _enhance_face_texture(image: Image.Image, strength: float) -> Image.Image:
-    rgb = np.asarray(image, dtype=np.uint8)
-    lab = cv2.cvtColor(rgb, cv2.COLOR_RGB2LAB)
-    lightness, channel_a, channel_b = cv2.split(lab)
-    clahe = cv2.createCLAHE(clipLimit=1.35 + strength * 0.35, tileGridSize=(8, 8))
-    local = clahe.apply(lightness)
-    broad = cv2.GaussianBlur(local, (0, 0), 2.0)
-    micro = cv2.GaussianBlur(local, (0, 0), 0.75)
-    broad_detail = local.astype(np.float32) - broad.astype(np.float32)
-    micro_detail = local.astype(np.float32) - micro.astype(np.float32)
-    enhanced = np.clip(
-        local.astype(np.float32) + broad_detail * (0.5 + strength * 0.35) + micro_detail * 0.35,
-        0,
-        255,
-    ).astype(np.uint8)
-    restored_lab = cv2.merge((enhanced, channel_a, channel_b))
-    restored_rgb = cv2.cvtColor(restored_lab, cv2.COLOR_LAB2RGB)
-    return Image.fromarray(restored_rgb, mode="RGB")
+def _detect_face_landmarks(image: Image.Image) -> np.ndarray | None:
+    """Five landmarks (eyes, nose tip, mouth corners) of the largest face, in image coordinates."""
+    model_path = _resource_path("models/face_detection_yunet_2023mar.onnx")
+    if not model_path.is_file():
+        return None
+    thumbnail = ImageOps.contain(image, (1280, 1280), Image.Resampling.BILINEAR)
+    bgr = cv2.cvtColor(np.asarray(thumbnail.convert("RGB")), cv2.COLOR_RGB2BGR)
+    detector = cv2.FaceDetectorYN.create(str(model_path), "", (bgr.shape[1], bgr.shape[0]), 0.6, 0.3, 50)
+    _, faces = detector.detect(bgr)
+    if faces is None or len(faces) == 0:
+        return None
+    face = max(faces, key=lambda item: float(item[2]) * float(item[3]))
+    landmarks = face[4:14].reshape(5, 2).astype(np.float32)
+    landmarks[:, 0] *= image.width / thumbnail.width
+    landmarks[:, 1] *= image.height / thumbnail.height
+    return landmarks
 
 
-def _restore_primary_face(image: Image.Image) -> Image.Image:
-    face = _detect_primary_face(image)
-    if face is None:
+def _restore_primary_face(image: Image.Image, restoration_mode: str = "natural") -> Image.Image:
+    """GFPGAN on the face aligned to the FFHQ template, then pasted back through the inverse transform.
+
+    GFPGAN only works on faces aligned the way it was trained; an unaligned crop gives a smeared face.
+    """
+    landmarks = _detect_face_landmarks(image)
+    if landmarks is None:
+        return image
+    _get_face_restorer()  # loads the model and fixes its input size
+    model_size = _FACE_RESTORER_SIZE
+    template = _FFHQ_TEMPLATE_512 * (model_size / 512)
+    affine, _ = cv2.estimateAffinePartial2D(landmarks, template, method=cv2.LMEDS)
+    if affine is None:
         return image
 
-    face_x, face_y, face_width, face_height = face
-    crop_size = min(image.width, image.height, round(max(face_width, face_height) * 1.35))
-    center_x = face_x + face_width // 2
-    center_y = face_y + face_height // 2
-    left = min(max(0, center_x - crop_size // 2), image.width - crop_size)
-    top = min(max(0, center_y - crop_size // 2), image.height - crop_size)
-    crop = image.crop((left, top, left + crop_size, top + crop_size))
-    focus_score = _crop_focus_score(crop)
-
-    model_size = _FACE_RESTORER_SIZE
-    model_image = crop.resize((model_size, model_size), Image.Resampling.LANCZOS)
-    model_input = np.asarray(model_image, dtype=np.float32) / 127.5 - 1.0
-    model_input = np.transpose(model_input, (2, 0, 1))[None]
+    rgb = np.asarray(image.convert("RGB"))
+    scale = float(np.hypot(affine[0, 0], affine[0, 1]))
+    aligned = cv2.warpAffine(
+        rgb,
+        affine,
+        (model_size, model_size),
+        flags=cv2.INTER_AREA if scale < 1 else cv2.INTER_LINEAR,
+        borderMode=cv2.BORDER_CONSTANT,
+        borderValue=(135, 133, 132),
+    )
+    model_input = np.transpose(aligned.astype(np.float32) / 127.5 - 1.0, (2, 0, 1))[None]
     with _FACE_RESTORER_LOCK:
         model_output = _get_face_restorer().run(None, {"input": model_input})[0][0]
-    restored_values = np.transpose(model_output, (1, 2, 0))
-    restored_values = np.clip((restored_values + 1.0) * 127.5, 0, 255).astype(np.uint8)
-    restored_raw = Image.fromarray(restored_values, mode="RGB").resize(crop.size, Image.Resampling.LANCZOS)
-    face_resolution = min(face_width, face_height)
-    focus_blend = 0.94 if focus_score < 12 else 0.76 if focus_score < 20 else 0.42 if focus_score < 30 else 0.22
-    resolution_blend = 0.46 if face_resolution >= 360 else 0.6 if face_resolution >= 280 else 0.74 if face_resolution >= 200 else 0.94
-    face_blend = min(focus_blend, resolution_blend)
-    hair_blend = min(0.42, face_blend * 0.5)
-    focus_texture = 0.86 if focus_score < 12 else 0.54 if focus_score < 20 else 0.22 if focus_score < 30 else 0.1
-    resolution_texture = 0.24 if face_resolution >= 360 else 0.4 if face_resolution >= 280 else 0.56 if face_resolution >= 200 else 0.86
-    texture_strength = min(focus_texture, resolution_texture)
-    restored_raw = _enhance_face_texture(restored_raw, texture_strength)
-    restored_hair = Image.blend(crop, restored_raw, hair_blend)
-    restored_hair = restored_hair.filter(ImageFilter.UnsharpMask(radius=0.8, percent=48, threshold=3))
-    restored_face = Image.blend(crop, restored_raw, face_blend)
-    restored_face = restored_face.filter(ImageFilter.UnsharpMask(radius=1.35, percent=72, threshold=2))
+    restored = np.clip((np.transpose(model_output, (1, 2, 0)) + 1.0) * 127.5, 0, 255).astype(np.uint8)
 
-    relative_x = face_x - left
-    relative_y = face_y - top
-    hair_mask = Image.new("L", crop.size, 0)
-    hair_draw = ImageDraw.Draw(hair_mask)
-    hair_padding = round(crop_size * 0.035)
-    hair_draw.rounded_rectangle(
-        (hair_padding, hair_padding, crop_size - hair_padding, crop_size - hair_padding),
-        radius=round(crop_size * 0.16),
-        fill=225,
-    )
-    hair_mask = hair_mask.filter(ImageFilter.GaussianBlur(radius=max(8, round(crop_size * 0.035))))
-    mask = Image.new("L", crop.size, 0)
-    draw = ImageDraw.Draw(mask)
-    draw.ellipse(
-        (
-            relative_x - round(face_width * 0.1),
-            relative_y - round(face_height * 0.08),
-            relative_x + round(face_width * 1.1),
-            relative_y + round(face_height * 1.14),
-        ),
-        fill=255,
-    )
-    mask = mask.filter(ImageFilter.GaussianBlur(radius=max(6, round(face_width * 0.075))))
-    result = image.copy()
-    result.paste(restored_hair, (left, top), hair_mask)
-    result.paste(restored_face, (left, top), mask)
-    return result
+    inverse = cv2.invertAffineTransform(affine)
+    size = (rgb.shape[1], rgb.shape[0])
+    restored_back = cv2.warpAffine(restored, inverse, size, flags=cv2.INTER_CUBIC, borderMode=cv2.BORDER_REPLICATE)
+    edge = max(4, model_size // 24)
+    mask = np.zeros((model_size, model_size), dtype=np.float32)
+    mask[edge:-edge, edge:-edge] = 1.0
+    mask = cv2.GaussianBlur(mask, (0, 0), edge * 1.5)
+    mask_back = cv2.warpAffine(mask, inverse, size, flags=cv2.INTER_LINEAR)
+
+    # Stronger modes trust the model more; a face much larger than the model output keeps more of its own detail.
+    strength = {"natural": 0.7, "strong": 0.85, "old_photo": 1.0}.get(restoration_mode, 0.7)
+    if scale < 0.8:
+        strength *= 0.8
+    alpha = (mask_back * strength)[..., None]
+    blended = rgb.astype(np.float32) * (1 - alpha) + restored_back.astype(np.float32) * alpha
+    return Image.fromarray(np.clip(blended, 0, 255).astype(np.uint8), mode="RGB")
 
 
 def _face_focus_score(image: Image.Image) -> float | None:
