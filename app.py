@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import hashlib
+import json
 import os
 import queue
 import subprocess
@@ -12,10 +14,14 @@ from tkinter import filedialog, messagebox, ttk
 
 from PIL import Image, ImageOps, ImageTk
 
-from ai_retouch import AIRetouchError, find_codex, load_template, retouch_with_openai
+from ai_retouch import AIRetouchError, ensure_template, find_codex, load_template, retouch_with_openai
 from config_store import AppSettings, load_settings, save_settings
 from graver_bridge import launch_graver_with_image
-from processor import TARGET_DPI, EngravingOptions, ProcessingError, process_portrait, render_preview
+from processor import TARGET_DPI, EngravingOptions, ProcessingError, process_portrait, render_preview, set_learned_model
+from report_uploader import ReportUploader
+from scanner import PhotoScanner
+from training import MIN_PAIRS, TrainingStore
+from stones import all_stones, get_stone, load_catalog, simulate_on_stone
 from updater import UpdateError, UpdateInfo, check_for_update, check_remote_access, download_installer, start_silent_update
 from version import APP_VERSION
 
@@ -24,21 +30,44 @@ APP_DIR = Path(__file__).resolve().parent
 DATA_DIR = Path(os.environ.get("APPDATA", str(Path.home()))) / "AI Graver"
 SETTINGS_PATH = DATA_DIR / "settings.ini"
 OUTPUT_DIR = DATA_DIR / "output"
-AI_CACHE_DIR = DATA_DIR / "ai_cache"
 AI_TEMPLATE_PATH = DATA_DIR / "ai_template.txt"
-AI_ERROR_LOG = DATA_DIR / "logs" / "ai_errors.log"
-STONE_LABELS = {
-    "Чёрный гранит / Карелия": "black_granite",
-    "Серый гранит": "gray_granite",
-    "Мрамор": "marble",
-}
+AI_CACHE_DIR = DATA_DIR / "ai_cache"
+AUTOLEARN_STATE_PATH = DATA_DIR / "autolearn.json"
+AUTO_RETRAIN_NEW_PAIRS = 3
+WISHES_HINT = "Например: убрать очки; убрать человека справа; тёмный костюм; волосы не трогать"
+
+
+def _with_wishes(template: str, wishes: str) -> str:
+    """Operator's wishes for this photo go after the template; keeping the person's identity still wins."""
+    if not wishes:
+        return template
+    return (
+        f"{template}\n\nOPERATOR WISHES FOR THIS PHOTO (written in Russian; follow them exactly, "
+        f"but never change the person's face or identity):\n{wishes}"
+    )
+
+
+STONES_PATH = DATA_DIR / "stones.json"
+load_catalog(STONES_PATH)
+STONE_LABELS = {f"{stone.group}: {stone.name}": stone.key for stone in all_stones()}
 STONE_NAMES = {value: label for label, value in STONE_LABELS.items()}
+DEFAULT_STONE_LABEL = STONE_NAMES["black_granite"]
 RESTORATION_LABELS = {
     "Естественно": "natural",
     "Сильное восстановление": "strong",
     "Старое / очень плохое фото": "old_photo",
 }
 RESTORATION_NAMES = {value: label for label, value in RESTORATION_LABELS.items()}
+
+
+def _desktop_dir() -> Path:
+    """Real desktop folder (it is often redirected to OneDrive\Рабочий стол)."""
+    import ctypes
+
+    buffer = ctypes.create_unicode_buffer(260)
+    if ctypes.windll.shell32.SHGetFolderPathW(None, 0, None, 0, buffer) == 0 and buffer.value:
+        return Path(buffer.value)
+    return Path.home() / "Desktop"
 
 
 def _find_graver_executable() -> str:
@@ -65,7 +94,7 @@ class AIGraverApp(tk.Tk):
             raise SystemExit(0)
         self.deiconify()
         self.title(f"AI Graver v{APP_VERSION}")
-        self.minsize(980, 640)
+        self.minsize(980, 700)  # below this the wishes button at the bottom of the sidebar gets cut off
         self.geometry("1280x800")
         self.colors = {
             "ink": "#172033",
@@ -91,10 +120,20 @@ class AIGraverApp(tk.Tk):
         elif not Path(self.settings.graver_exe).is_file():
             self.settings.graver_exe = ""
         self.source_path: Path | None = None
+        self.ai_source_path: Path | None = None
+        self.training = TrainingStore(DATA_DIR)
+        self.reports = ReportUploader(self.training)
+        self.scanner = PhotoScanner(DATA_DIR)
+        self.training.extra_pairs = self.scanner.pairs
+        self.scan_running = False
+        self.training_auto = False
+        self.ai_failed = False
+        self.learned_model = self.training.load_active_model()
+        set_learned_model(self.learned_model)
+        self.use_learned = tk.BooleanVar(value=True)
+        self.training_running = False
         self.restored_path: Path | None = None
         self.result_path: Path | None = None
-        # AI retouch result per source photo: previews and re-processing reuse it instead of the original.
-        self.ai_results: dict[Path, Path] = {}
         self.message_queue: queue.Queue[tuple[str, object]] = queue.Queue()
         self.original_preview: ImageTk.PhotoImage | None = None
         self.result_preview: ImageTk.PhotoImage | None = None
@@ -111,15 +150,20 @@ class AIGraverApp(tk.Tk):
         self.export_bmp = tk.BooleanVar(value=self.settings.export_bmp)
         self.portrait_mode = tk.StringVar(value=self.settings.portrait_mode if self.settings.portrait_mode in {"chest", "full"} else "chest")
         self.graver_exe = tk.StringVar(value=self.settings.graver_exe)
-        self.auto_mode = tk.BooleanVar(value=self.settings.auto_mode)
-        self.stone_profile = tk.StringVar(value=STONE_NAMES.get(self.settings.stone_profile, "Чёрный гранит / Карелия"))
+        self.auto_mode = tk.BooleanVar(value=True)
+        self.stone_profile = tk.StringVar(value=STONE_NAMES.get(self.settings.stone_profile, DEFAULT_STONE_LABEL))
         self.enhance_4k = tk.BooleanVar(value=self.settings.enhance_4k)
         self.restoration_mode = tk.StringVar(value=RESTORATION_NAMES.get(self.settings.restoration_mode, "Естественно"))
+        self.stone_view = tk.BooleanVar(value=True)
+        self.last_tone_report = ""
+        self.openai_api_key = tk.StringVar(value=self.settings.openai_api_key)
+        self.openai_model = tk.StringVar(value=self.settings.openai_model)
         self.status = tk.StringVar(value="Выберите фотографию для подготовки.")
 
         self._build_compact_ui()
         self.after(150, self._poll_queue)
         self.after(1200, lambda: self._check_updates(announce=False))
+        self.after(2500, self._start_reports)
         self.protocol("WM_DELETE_WINDOW", self._on_close)
 
     def _build_ui(self) -> None:
@@ -277,6 +321,16 @@ class AIGraverApp(tk.Tk):
         tk.Label(header, text="Автоматическая подготовка портрета", bg=self.colors["header"], fg=self.colors["header_muted"], font=(font, 9)).pack(side="left", padx=(14, 0))
         tk.Label(header, text=f"v{APP_VERSION}", bg="#273653", fg="#DCE7FF", font=(font, 9, "bold"), padx=10, pady=5).pack(side="right")
         ttk.Button(header, text="Обновления", style="Dark.TButton", command=self._check_updates).pack(side="right", padx=(0, 8))
+        self.header_menu = tk.Menu(self, tearoff=False, font=(font, 9))
+        self.header_menu.add_command(label="Обучение…", command=self._open_training)
+        self.header_menu.add_command(label="Открыть результаты", command=self._open_output_folder)
+        self.header_menu.add_command(label="Путь к Graver…", command=self._select_graver)
+        self.header_menu.add_command(label="AI-ретушь: ключ и шаблон…", command=self._open_ai_settings)
+        menu_button = ttk.Button(header, text="Меню ▾", style="Dark.TButton")
+        menu_button.configure(
+            command=lambda: self.header_menu.tk_popup(menu_button.winfo_rootx(), menu_button.winfo_rooty() + menu_button.winfo_height())
+        )
+        menu_button.pack(side="right", padx=(0, 8))
 
         body = tk.Frame(root, bg=self.colors["page"], padx=12, pady=12)
         body.pack(fill="both", expand=True)
@@ -304,21 +358,16 @@ class AIGraverApp(tk.Tk):
         self.open_in_graver_button.pack(side="left", fill="x", expand=True, padx=(3, 0))
         self.save_button.state(["disabled"])
         self.open_in_graver_button.state(["disabled"])
-        ttk.Checkbutton(
-            self.actions_card,
-            text="Полный автомат",
-            variable=self.auto_mode,
-            style="Modern.TCheckbutton",
-        ).pack(anchor="w", pady=(9, 0))
-        tk.Label(self.actions_card, text="Обработка → сохранение → Graver", bg=self.colors["card"], fg=self.colors["muted"], font=(font, 8)).pack(anchor="w", pady=(1, 0))
+        tk.Label(self.actions_card, text="AI-ретушь → обработка → сохранение → Graver", bg=self.colors["card"], fg=self.colors["muted"], font=(font, 8)).pack(anchor="w", pady=(6, 0))
 
         ttk.Separator(sidebar).pack(fill="x", pady=8)
         tk.Label(sidebar, text="РУЧНАЯ КОРРЕКЦИЯ", bg=self.colors["card"], fg=self.colors["muted"], font=(font, 8, "bold")).pack(anchor="w")
         stone_row = tk.Frame(sidebar, bg=self.colors["card"])
         stone_row.pack(fill="x", pady=(6, 1))
-        tk.Label(stone_row, text="Камень", bg=self.colors["card"], fg=self.colors["ink"], font=(font, 9)).pack(side="left")
-        stone_picker = ttk.Combobox(stone_row, textvariable=self.stone_profile, values=list(STONE_LABELS), state="readonly", width=20, font=(font, 8))
-        stone_picker.pack(side="right")
+        tk.Label(stone_row, text="Камень памятника", bg=self.colors["card"], fg=self.colors["ink"], font=(font, 9)).pack(side="left")
+        ttk.Checkbutton(stone_row, text="вид на камне", variable=self.stone_view, style="Modern.TCheckbutton", command=self._refresh_result_view).pack(side="right")
+        stone_picker = ttk.Combobox(sidebar, textvariable=self.stone_profile, values=list(STONE_LABELS), state="readonly", height=20, font=(font, 8))
+        stone_picker.pack(fill="x", pady=(2, 0))
         stone_picker.bind("<<ComboboxSelected>>", lambda _event: self._schedule_preview(delay=50))
         ttk.Checkbutton(sidebar, text="AI-ретушь (ChatGPT) + лицо + 4K", variable=self.enhance_4k, style="Modern.TCheckbutton", command=self._schedule_preview).pack(anchor="w", pady=(4, 0))
         restoration_picker = ttk.Combobox(sidebar, textvariable=self.restoration_mode, values=list(RESTORATION_LABELS), state="readonly", width=26, font=(font, 8))
@@ -339,10 +388,17 @@ class AIGraverApp(tk.Tk):
         ttk.Checkbutton(output_options, text="BMP", variable=self.export_bmp, style="Modern.TCheckbutton").pack(side="right")
 
         ttk.Separator(sidebar).pack(fill="x", pady=8)
-        bottom_actions = tk.Frame(sidebar, bg=self.colors["card"])
-        bottom_actions.pack(fill="x")
-        ttk.Button(bottom_actions, text="Graver", style="Secondary.TButton", command=self._select_graver).pack(side="left", fill="x", expand=True, padx=(0, 3))
-        ttk.Button(bottom_actions, text="Результаты", style="Secondary.TButton", command=self._open_output_folder).pack(side="left", fill="x", expand=True, padx=(3, 0))
+        tk.Label(sidebar, text="ПОЖЕЛАНИЯ К РЕТУШИ ЭТОГО ФОТО", bg=self.colors["card"], fg=self.colors["muted"], font=(font, 8, "bold")).pack(anchor="w")
+        self.wishes_text = tk.Text(
+            sidebar, height=3, wrap="word", font=(font, 9), relief="flat", padx=6, pady=4,
+            bg=self.colors["soft"], fg=self.colors["ink"], insertbackground=self.colors["ink"],
+            highlightthickness=1, highlightbackground=self.colors["border"], highlightcolor=self.colors["accent"],
+        )
+        self.wishes_text.pack(fill="x", pady=(4, 4))
+        self._wishes_placeholder(show=True)
+        self.wishes_text.bind("<FocusIn>", lambda _event: self._wishes_placeholder(show=False))
+        self.wishes_text.bind("<FocusOut>", lambda _event: self._wishes_placeholder(show=not self._wishes()))
+        ttk.Button(sidebar, text="Переделать с пожеланиями", style="Primary.TButton", command=self._process).pack(fill="x")
 
         workspace = tk.Frame(body, bg=self.colors["card"], highlightthickness=1, highlightbackground=self.colors["border"], padx=14, pady=12)
         workspace.pack(side="left", fill="both", expand=True, padx=(12, 0))
@@ -417,6 +473,23 @@ class AIGraverApp(tk.Tk):
         image_label.pack(fill="both", expand=True, pady=(10, 0))
         return image_label
 
+    def _wishes(self) -> str:
+        """Operator's wishes for this photo (empty while the grey example hint is shown)."""
+        if getattr(self, "_wishes_hint_shown", False):
+            return ""
+        return self.wishes_text.get("1.0", "end").strip()
+
+    def _wishes_placeholder(self, show: bool) -> None:
+        if show and not getattr(self, "_wishes_hint_shown", False):
+            self.wishes_text.delete("1.0", "end")
+            self.wishes_text.insert("1.0", WISHES_HINT)
+            self.wishes_text.configure(fg=self.colors["muted"])
+            self._wishes_hint_shown = True
+        elif not show and getattr(self, "_wishes_hint_shown", False):
+            self.wishes_text.delete("1.0", "end")
+            self.wishes_text.configure(fg=self.colors["ink"])
+            self._wishes_hint_shown = False
+
     def _select_image(self) -> None:
         selected = filedialog.askopenfilename(
             title="Выберите портрет",
@@ -425,7 +498,11 @@ class AIGraverApp(tk.Tk):
         if not selected:
             return
         self.source_path = Path(selected)
+        self.ai_source_path = None
         self.restored_path = None
+        # Wishes belong to one photo: never carry "remove the glasses" over to the next client.
+        self._wishes_placeholder(show=False)
+        self._wishes_placeholder(show=True)
         self._show_preview(self.source_path, self.source_label, "original")
         self.result_path = None
         self._update_result_actions_state()
@@ -435,33 +512,6 @@ class AIGraverApp(tk.Tk):
         else:
             self.status.set("Создаю быстрый предпросмотр с текущими настройками…")
             self._schedule_preview(delay=20)
-
-    def _update_result_actions_state(self) -> None:
-        has_result = bool(self.result_path and self.result_path.is_file())
-        state = ["!disabled"] if has_result else ["disabled"]
-        self.save_button.state(state)
-        self.open_in_graver_button.state(state)
-
-    def _save_result_as(self) -> None:
-        if not self.result_path or not self.result_path.is_file():
-            messagebox.showwarning("Нет результата", "Сначала обработайте фотографию.")
-            return
-        selected = filedialog.asksaveasfilename(
-            title="Сохранить файл для Graver",
-            initialfile=self.result_path.name,
-            defaultextension=self.result_path.suffix,
-            filetypes=[("PNG", "*.png"), ("Bitmap", "*.bmp"), ("Все файлы", "*.*")],
-        )
-        if not selected:
-            return
-        destination = Path(selected)
-        try:
-            with Image.open(self.result_path) as image:
-                image.convert("L").save(destination, dpi=TARGET_DPI)
-        except OSError as error:
-            messagebox.showerror("Не удалось сохранить", str(error))
-            return
-        self.status.set(f"Сохранено: {destination}")
 
     def _select_graver(self) -> None:
         selected = filedialog.askopenfilename(
@@ -487,12 +537,19 @@ class AIGraverApp(tk.Tk):
             black_background=self.black_background.get(),
             export_bmp=self.export_bmp.get(),
             portrait_mode=self.portrait_mode.get(),
-            stone_profile=STONE_LABELS.get(self.stone_profile.get(), "black_granite"),
+            stone_profile=self._stone_key(),
             enhance_4k=self.enhance_4k.get(),
             restoration_mode=RESTORATION_LABELS.get(self.restoration_mode.get(), "natural"),
+            use_learned=self.use_learned.get(),
         )
-        ai_access = self._ai_access() if options.enhance_4k else None
-        thread = threading.Thread(target=self._run_processing, args=(self.source_path, options, ai_access), daemon=True)
+        ai_config = self._ai_config() if options.enhance_4k else None
+        wishes = self._wishes()
+        self.ai_failed = False
+        if ai_config:
+            ai_config["wishes"] = wishes
+        else:
+            self.ai_failed = True
+        thread = threading.Thread(target=self._run_processing, args=(self.source_path, options, ai_config), daemon=True)
         thread.start()
 
     def _on_slider_change(self, variable: tk.IntVar, value: str) -> None:
@@ -525,16 +582,19 @@ class AIGraverApp(tk.Tk):
             black_background=self.black_background.get(),
             export_bmp=self.export_bmp.get(),
             portrait_mode=self.portrait_mode.get(),
-            stone_profile=STONE_LABELS.get(self.stone_profile.get(), "black_granite"),
+            stone_profile=self._stone_key(),
             enhance_4k=self.enhance_4k.get(),
             restoration_mode=RESTORATION_LABELS.get(self.restoration_mode.get(), "natural"),
+            use_learned=self.use_learned.get(),
         )
         source = self.source_path
-        ai_result = self.ai_results.get(source) if options.enhance_4k else None
-        if ai_result and ai_result.is_file():
-            source, options = ai_result, replace(options, ai_retouched=True)
+        if self.ai_source_path and self.ai_source_path.is_file() and options.enhance_4k:
+            source, options = self.ai_source_path, replace(options, ai_retouched=True)
         thread = threading.Thread(target=self._run_preview, args=(revision, source, options), daemon=True)
         thread.start()
+
+    def _stone_key(self) -> str:
+        return STONE_LABELS.get(self.stone_profile.get(), "black_granite")
 
     def _run_preview(self, revision: int, source: Path, options: EngravingOptions) -> None:
         try:
@@ -576,45 +636,58 @@ class AIGraverApp(tk.Tk):
         if not self.update_banner.winfo_ismapped():
             self.update_banner.pack(fill="x", pady=(16, 0), before=self.actions_card)
 
-    def _ai_access(self) -> dict | None:
-        keys = [self.settings.openai_api_key, os.environ.get("OPENAI_API_KEY", "")]
-        keys = list(dict.fromkeys(key.strip() for key in keys if key and key.strip()))
-        if not keys and not find_codex():
-            self._log_ai_problem("нет ни Codex (вход через ChatGPT), ни ключа OpenAI API")
-            return None
-        return {"api_keys": keys, "model": self.settings.openai_model}
-
     def _log_ai_problem(self, text: str) -> None:
         try:
-            AI_ERROR_LOG.parent.mkdir(parents=True, exist_ok=True)
-            with AI_ERROR_LOG.open("a", encoding="utf-8") as file:
+            self.training.log_dir.mkdir(parents=True, exist_ok=True)
+            with (self.training.log_dir / "ai_errors.log").open("a", encoding="utf-8") as file:
                 file.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} {text}\n")
         except OSError:
             pass
 
-    def _run_processing(self, source: Path, options: EngravingOptions, ai_access: dict | None = None) -> None:
-        original = source
-        ai_used = False
-        if ai_access:
+    def _ai_config(self) -> dict | None:
+        keys = [self.openai_api_key.get().strip(), os.environ.get("OPENAI_API_KEY", "").strip()]
+        keys = list(dict.fromkeys(key for key in keys if key))
+        if not keys and not find_codex():
+            self._log_ai_problem("нет ни Codex, ни ключа OpenAI")
+            return None
+        return {"api_keys": keys, "model": self.openai_model.get().strip()}
+
+    def _run_processing(self, source: Path, options: EngravingOptions, ai_config: dict | None = None) -> None:
+        if ai_config:
             try:
                 stem = "".join(char if char.isalnum() or char in "-_" else "_" for char in source.stem) or "portrait"
                 source = retouch_with_openai(
                     source,
                     OUTPUT_DIR / f"{stem}_ai.png",
-                    ai_access["api_keys"],
-                    load_template(AI_TEMPLATE_PATH),
+                    ai_config["api_keys"],
+                    _with_wishes(load_template(AI_TEMPLATE_PATH), ai_config.get("wishes", "")),
                     AI_CACHE_DIR,
-                    ai_access["model"],
+                    ai_config["model"],
                 )
+                # The retouch already restored the face: the local face model would only soften it.
                 options = replace(options, ai_retouched=True)
-                ai_used = True
-                self.message_queue.put(("ai_ready", (original, source)))
+                self.message_queue.put(("ai_ready", source))
             except AIRetouchError as error:
-                self._log_ai_problem(str(error))
                 self.message_queue.put(("ai_error", error))
         try:
-            result = process_portrait(source, OUTPUT_DIR, options)
-            self.message_queue.put(("done", (result, ai_used)))
+            reports: list = []
+            result = process_portrait(source, OUTPUT_DIR, options, reports)
+            if reports:
+                self.last_tone_report = reports[0].summary(get_stone(options.stone_profile))
+            self.training.log_processing({
+                "source": hashlib.sha1(source.name.encode("utf-8")).hexdigest()[:10],  # names often hold surnames
+                "stone": options.stone_profile,
+                "ai_retouch": options.ai_retouched,
+                "restoration_mode": options.restoration_mode,
+                "wishes": bool(ai_config and ai_config.get("wishes")),  # the text itself stays on this PC
+                "learned": bool(options.use_learned and self.learned_model),
+                "contrast": options.contrast,
+                "detail": options.detail,
+                "shadows": options.shadows,
+                "portrait_mode": options.portrait_mode,
+                "tone": self.last_tone_report,
+            })
+            self.message_queue.put(("done", (result, options.ai_retouched)))
         except Exception as error:  # display full processing errors in GUI
             self.message_queue.put(("error", error))
 
@@ -645,45 +718,71 @@ class AIGraverApp(tk.Tk):
                         self.status.set(str(error))
                     else:
                         self.after(700, self.destroy)
-                elif kind == "ai_ready":
-                    original, retouched = payload  # type: ignore[misc]
-                    self.ai_results[original] = retouched
-                    self._show_preview(retouched, self.source_label, "original")
-                    self.status.set("AI-ретушь готова — готовлю 4K и файл для Graver…")
-                elif kind == "ai_error":
-                    self.status.set("AI-ретушь недоступна — восстанавливаю лицо локально (GFPGAN), 1–3 минуты…")
                 elif kind == "done":
                     self.process_button.state(["!disabled"])
                     self.result_path, ai_used = payload  # type: ignore[misc]
+                    self._update_result_actions_state()
                     restored_path = self.result_path.with_name(self.result_path.name.replace("_graver_ready.png", "_restored_4k.png"))
                     if restored_path.is_file():
                         self.restored_path = restored_path
                         self._show_preview(self.restored_path, self.source_label, "original")
-                    self._show_preview(self.result_path, self.result_label, "result")
-                    self._update_result_actions_state()
+                    self._refresh_result_view()
                     method = "AI-ретушь ChatGPT" if ai_used else ("локальный GFPGAN" if self.enhance_4k.get() else "без AI")
-                    self.status.set(f"Готово ({method}). Слева — улучшенное 4K, справа — для Graver. Двойной щелчок — полный размер.")
+                    self.status.set(f"Готово ({method}). {self.last_tone_report}. Двойной щелчок — полный размер.")
                     if self.auto_mode.get() and Path(self.graver_exe.get().strip()).is_file():
                         self.after(250, self._launch_graver)
-                elif kind == "preview":
-                    self.preview_running = False
-                    revision, image = payload  # type: ignore[misc]
-                    if revision == self.preview_revision:
-                        photo = ImageTk.PhotoImage(image)
-                        self.result_label.configure(image=photo, text="")
-                        self.result_preview = photo
-                        self.status.set("Предпросмотр обновлён. Нажмите «Сделать для Graver», чтобы сохранить файл.")
-                    else:
-                        self._schedule_preview(delay=20)
-                elif kind == "preview_error":
-                    self.preview_running = False
-                    self.status.set(f"Не удалось обновить предпросмотр: {payload}")
+                    self.reports.upload_in_background()
+                elif kind == "training_progress":
+                    self.status.set(str(payload))
+                elif kind == "scan_done":
+                    self._after_scan(payload)
+                elif kind == "training_done":
+                    self.training_running = False
+                    model, stats = payload  # type: ignore[misc]
+                    AUTOLEARN_STATE_PATH.write_text(
+                        json.dumps({"trained_pairs": len(self.training.all_pairs()), "model": model.updated}), encoding="utf-8"
+                    )
+                    self.learned_model = model
+                    set_learned_model(model)
+                    compared = [item for item in stats if "difference_after" in item]
+                    better = sum(item["difference_after"] < item["difference_before"] for item in compared)
+                    self.status.set(f"{model.summary()}. Ближе к ручному финалу: {better} из {len(compared)} примеров.")
+                    self._schedule_preview(delay=50)
+                    self.reports.upload_in_background()
+                elif kind == "training_error":
+                    self.training_running = False
+                    self.status.set(f"Обучение не выполнено: {payload}")
+                    if not self.training_auto:
+                        messagebox.showwarning("Обучение", str(payload))
+                elif kind == "ai_ready":
+                    self.ai_source_path = payload  # type: ignore[assignment]
+                    self._show_preview(self.ai_source_path, self.source_label, "original")
+                elif kind == "ai_error":
+                    # Technical details (Codex, keys, balance) go to the log and the report, not on screen.
+                    self.ai_failed = True
+                    self._log_ai_problem(str(payload))
+                    self.status.set("AI-ретушь недоступна — восстанавливаю лицо локально (GFPGAN), 1–3 минуты…")
                 elif kind == "graver_launched":
                     self._update_result_actions_state()
                     self.status.set(payload.message)  # type: ignore[union-attr]
                 elif kind == "graver_error":
                     self._update_result_actions_state()
                     messagebox.showerror("Не удалось запустить Graver", str(payload))
+                elif kind == "preview":
+                    self.preview_running = False
+                    revision, image = payload  # type: ignore[misc]
+                    if revision == self.preview_revision:
+                        if self.stone_view.get():
+                            image = simulate_on_stone(image, get_stone(self._stone_key()))
+                        photo = ImageTk.PhotoImage(image)
+                        self.result_label.configure(image=photo, text="")
+                        self.result_preview = photo
+                        self.status.set("Предпросмотр обновлён. Нажмите «Обработать повторно», чтобы сохранить файл.")
+                    else:
+                        self._schedule_preview(delay=20)
+                elif kind == "preview_error":
+                    self.preview_running = False
+                    self.status.set(f"Не удалось обновить предпросмотр: {payload}")
                 else:
                     self.process_button.state(["!disabled"])
                     error = payload
@@ -692,6 +791,16 @@ class AIGraverApp(tk.Tk):
         except queue.Empty:
             pass
         self.after(150, self._poll_queue)
+
+    def _refresh_result_view(self) -> None:
+        if not self.result_path or not self.result_path.is_file():
+            self._schedule_preview(delay=50)
+            return
+        stone_path = self.result_path.with_name(self.result_path.name.replace("_graver_ready.png", "_on_stone.jpg"))
+        if self.stone_view.get() and stone_path.is_file():
+            self._show_preview(stone_path, self.result_label, "result")
+        else:
+            self._show_preview(self.result_path, self.result_label, "result")
 
     def _show_preview(self, image_path: Path, label: tk.Label, kind: str) -> None:
         with Image.open(image_path) as image:
@@ -702,6 +811,175 @@ class AIGraverApp(tk.Tk):
             self.original_preview = photo
         else:
             self.result_preview = photo
+
+    def _open_ai_settings(self) -> None:
+        dialog = tk.Toplevel(self)
+        dialog.title("AI-ретушь OpenAI")
+        dialog.configure(bg=self.colors["card"], padx=16, pady=14)
+        dialog.resizable(False, False)
+        dialog.transient(self)
+        font = "Segoe UI"
+        tk.Label(dialog, text="Ключ OpenAI API (platform.openai.com → API keys)", bg=self.colors["card"], fg=self.colors["ink"], font=(font, 9, "bold")).pack(anchor="w")
+        key_entry = ttk.Entry(dialog, textvariable=self.openai_api_key, show="•", width=52, style="Modern.TEntry")
+        key_entry.pack(fill="x", pady=(4, 10))
+        tk.Label(dialog, text="Модель", bg=self.colors["card"], fg=self.colors["ink"], font=(font, 9, "bold")).pack(anchor="w")
+        ttk.Entry(dialog, textvariable=self.openai_model, width=52, style="Modern.TEntry").pack(fill="x", pady=(4, 10))
+        tk.Label(
+            dialog,
+            text="Шаблон — это текст-задание, которое отправляется вместе с каждым фото.\n"
+            "Его можно поправить в Блокноте; изменения применяются к следующему фото.",
+            bg=self.colors["card"], fg=self.colors["muted"], font=(font, 8), justify="left",
+        ).pack(anchor="w")
+        buttons = tk.Frame(dialog, bg=self.colors["card"])
+        buttons.pack(fill="x", pady=(10, 0))
+        ttk.Button(buttons, text="Открыть шаблон", style="Secondary.TButton", command=lambda: os.startfile(ensure_template(AI_TEMPLATE_PATH))).pack(side="left")
+
+        def save_and_close() -> None:
+            self._save_settings()
+            dialog.destroy()
+
+        ttk.Button(buttons, text="Сохранить", style="Primary.TButton", command=save_and_close).pack(side="right")
+        key_entry.focus_set()
+
+    def _open_training(self) -> None:
+        dialog = tk.Toplevel(self)
+        dialog.title("Обучение AI Graver")
+        dialog.configure(bg=self.colors["card"], padx=16, pady=14)
+        dialog.resizable(False, False)
+        dialog.transient(self)
+        font = "Segoe UI"
+        def info_text() -> str:
+            model = self.learned_model.summary() if self.learned_model else "Модель ещё не обучена"
+            folders = len(self.scanner.folders())
+            return (
+                f"{model}\nВаших примеров: {self.training.pair_count()}, "
+                f"найдено в папках самообучения ({folders}): {len(self.scanner.pairs())}"
+            )
+
+        info = tk.StringVar(value=info_text())
+        tk.Label(dialog, textvariable=info, bg=self.colors["card"], fg=self.colors["ink"], font=(font, 9, "bold"), justify="left").pack(anchor="w")
+        tk.Label(
+            dialog,
+            text="Программа учится на парах «исходное фото → ваш готовый файл для станка»:\n"
+            "где добавить белого, где чёрного и каким должен быть тон лица.",
+            bg=self.colors["card"], fg=self.colors["muted"], font=(font, 8), justify="left",
+        ).pack(anchor="w", pady=(4, 8))
+        ttk.Checkbutton(dialog, text="Применять обучение при обработке", variable=self.use_learned, style="Modern.TCheckbutton", command=self._schedule_preview).pack(anchor="w", pady=(0, 8))
+
+        def refresh() -> None:
+            info.set(info_text())
+
+        def add_scan_folder() -> None:
+            folder = filedialog.askdirectory(parent=dialog, title="Папка, где лежат ваши заказы (исходники и файлы «на грав»)")
+            if not folder:
+                return
+            self.scanner.add_folder(Path(folder))
+            refresh()
+            messagebox.showinfo(
+                "Самообучение",
+                "Папка добавлена. Программа сама изучит фото в фоне, найдёт пары «исходник → финал» "
+                "и дообучится. Фото никуда не копируются. Новые заказы в этой папке будут изучаться при каждом запуске.",
+                parent=dialog,
+            )
+            self._auto_learn()
+
+        def add_final() -> None:
+            if not self.source_path:
+                messagebox.showwarning("Нет фото", "Сначала откройте исходное фото, затем укажите ваш готовый файл для станка.", parent=dialog)
+                return
+            final = filedialog.askopenfilename(parent=dialog, title="Ваш готовый файл для станка", filetypes=[("Изображения", "*.png *.jpg *.jpeg *.bmp *.tif *.tiff *.webp")])
+            if final:
+                self.training.add_pair(self.source_path, Path(final))
+                refresh()
+
+        def import_folder() -> None:
+            folder = filedialog.askdirectory(parent=dialog, title="Папка с заказами (в каждой подпапке — исходник и файл «на грав»)")
+            if not folder:
+                return
+            added, skipped = self.training.import_folder(Path(folder))
+            refresh()
+            note = f"Добавлено пар: {added}."
+            if skipped:
+                note += f"\nПропущено подпапок: {len(skipped)} (не нашёл исходник или файл со словом «грав»/«финал» в названии)."
+            messagebox.showinfo("Импорт", note, parent=dialog)
+
+        def export_report() -> None:
+            include = messagebox.askyesno(
+                "Отчёт для анализа",
+                "Добавить в отчёт уменьшенные копии фото из примеров (640 px)?\n\n"
+                "«Да» — анализ будет точнее, но в архиве будут фото клиентов.\n«Нет» — только цифры и журналы.",
+                parent=dialog,
+            )
+            archive = self.training.export_report(_desktop_dir(), include)
+            messagebox.showinfo("Отчёт готов", f"Архив сохранён:\n{archive}\n\nОтправьте его разработчику.", parent=dialog)
+            subprocess.Popen(["explorer", "/select,", str(archive)])
+
+        buttons = [
+            ("Папка для самообучения…", add_scan_folder),
+            ("Мой финал для открытого фото…", add_final),
+            ("Импорт папки с заказами…", import_folder),
+            ("Открыть папку примеров", lambda: os.startfile(self.training.examples_dir)),
+            ("Обучить на примерах", lambda: (self._start_training(), dialog.destroy())),
+            ("Отчёт для анализа (zip на рабочий стол)", export_report),
+        ]
+        for text, command in buttons:
+            ttk.Button(dialog, text=text, style="Primary.TButton" if text.startswith("Обучить") else "Secondary.TButton", command=command).pack(fill="x", pady=2)
+
+    def _start_reports(self) -> None:
+        # The operator agreed to reports in advance (see ИНСТРУКЦИЯ_ОПЕРАТОРУ.md), so no pop-up here.
+        self.reports.upload_in_background()
+        self._auto_learn()
+
+    def _auto_learn(self) -> None:
+        """Rescan the self-learning folders in the background; retrain when enough new pairs appear."""
+        if self.scan_running or not self.scanner.folders():
+            return
+        self.scan_running = True
+
+        def run() -> None:
+            try:
+                result = self.scanner.scan(lambda text: self.message_queue.put(("training_progress", text)))
+                self.message_queue.put(("scan_done", result))
+            except Exception as error:
+                self.message_queue.put(("scan_done", error))
+
+        threading.Thread(target=run, daemon=True).start()
+
+    def _after_scan(self, result: object) -> None:
+        self.scan_running = False
+        if isinstance(result, Exception):
+            self.status.set(f"Не удалось изучить папки: {result}")
+            return
+        files, found = result  # type: ignore[misc]
+        total = len(self.training.all_pairs())
+        trained = self._autolearn_state().get("trained_pairs", 0)
+        if total >= MIN_PAIRS and total - trained >= AUTO_RETRAIN_NEW_PAIRS:
+            self.status.set(f"Изучено фото: {files}, пар найдено: {found}. Дообучаюсь в фоне…")
+            self._start_training(auto=True)
+        else:
+            self.status.set(f"Изучено фото: {files}, пар найдено: {found}. Новых пар для дообучения мало, жду новых заказов.")
+
+    def _autolearn_state(self) -> dict:
+        try:
+            return json.loads(AUTOLEARN_STATE_PATH.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return {}
+
+    def _start_training(self, auto: bool = False) -> None:
+        if self.training_running:
+            return
+        self.training_running = True
+        self.training_auto = auto
+        self.status.set("Обучение запущено — первый раз около 20 секунд на пример, дальше быстрее…")
+
+        def run() -> None:
+            try:
+                result = self.training.train(lambda text: self.message_queue.put(("training_progress", text)))
+                self.message_queue.put(("training_done", result))
+            except Exception as error:
+                self.message_queue.put(("training_error", error))
+
+        threading.Thread(target=run, daemon=True).start()
 
     def _open_output_folder(self) -> None:
         OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
@@ -722,17 +1000,46 @@ class AIGraverApp(tk.Tk):
             return
         self.open_in_graver_button.state(["disabled"])
         self.status.set("Запускаю Graver и передаю изображение…")
-        thread = threading.Thread(target=self._run_launch_graver, args=(executable, self.result_path), daemon=True)
-        thread.start()
+        # Window automation waits up to ~35 s for Graver's dialogs: keep it off the GUI thread.
+        threading.Thread(target=self._run_launch_graver, args=(executable, self.result_path), daemon=True).start()
 
     def _run_launch_graver(self, executable: Path, image_path: Path) -> None:
         try:
-            result = launch_graver_with_image(executable, image_path)
-            self.message_queue.put(("graver_launched", result))
+            self.message_queue.put(("graver_launched", launch_graver_with_image(executable, image_path)))
         except (OSError, RuntimeError) as error:
             self.message_queue.put(("graver_error", error))
 
+    def _update_result_actions_state(self) -> None:
+        state = ["!disabled"] if self.result_path and self.result_path.is_file() else ["disabled"]
+        self.save_button.state(state)
+        self.open_in_graver_button.state(state)
+
+    def _save_result_as(self) -> None:
+        if not self.result_path or not self.result_path.is_file():
+            messagebox.showwarning("Нет результата", "Сначала обработайте фотографию.")
+            return
+        selected = filedialog.asksaveasfilename(
+            title="Сохранить файл для Graver",
+            initialfile=self.result_path.name,
+            defaultextension=self.result_path.suffix,
+            filetypes=[("PNG", "*.png"), ("Bitmap", "*.bmp"), ("Все файлы", "*.*")],
+        )
+        if not selected:
+            return
+        destination = Path(selected)
+        try:
+            with Image.open(self.result_path) as image:
+                image.convert("L").save(destination, dpi=TARGET_DPI)
+        except OSError as error:
+            messagebox.showerror("Не удалось сохранить", str(error))
+            return
+        self.status.set(f"Сохранено: {destination}")
+
     def _on_close(self) -> None:
+        self._save_settings()
+        self.destroy()
+
+    def _save_settings(self) -> None:
         save_settings(
             SETTINGS_PATH,
             AppSettings(
@@ -743,17 +1050,15 @@ class AIGraverApp(tk.Tk):
                 export_bmp=self.export_bmp.get(),
                 portrait_mode=self.portrait_mode.get(),
                 graver_exe=self.graver_exe.get().strip(),
-                auto_mode=self.auto_mode.get(),
-                stone_profile=STONE_LABELS.get(self.stone_profile.get(), "black_granite"),
+                auto_mode=True,
+                stone_profile=self._stone_key(),
                 enhance_4k=self.enhance_4k.get(),
                 restoration_mode=RESTORATION_LABELS.get(self.restoration_mode.get(), "natural"),
-                openai_api_key=self.settings.openai_api_key,
-                openai_model=self.settings.openai_model,
+                openai_api_key=self.openai_api_key.get().strip(),
+                openai_model=self.openai_model.get().strip() or "gpt-image-1",
             ),
         )
-        self.destroy()
 
 
 if __name__ == "__main__":
     AIGraverApp().mainloop()
-from graver_bridge import launch_graver_with_image

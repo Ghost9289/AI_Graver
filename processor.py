@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from collections import deque
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 import sys
 import threading
@@ -9,6 +9,9 @@ import threading
 import cv2
 import numpy as np
 from PIL import Image, ImageEnhance, ImageFilter, ImageOps, UnidentifiedImageError
+
+from learning import LearnedModel, apply_model
+from stones import ToneReport, fit_tones_to_stone, get_stone, simulate_on_stone
 
 
 TARGET_SIZE = (3084, 5526)
@@ -29,6 +32,18 @@ _FFHQ_TEMPLATE_512 = np.array(
     [[192.98138, 239.94708], [318.90277, 240.1936], [256.63416, 314.01935], [201.26117, 371.41043], [313.08905, 371.15118]],
     dtype=np.float32,
 )
+_LEARNED_MODEL: LearnedModel | None = None
+# Face tone of the base stone profile the learned model was trained against.
+_REFERENCE_STONE = "black_granite"
+
+
+def set_learned_model(model: LearnedModel | None) -> None:
+    global _LEARNED_MODEL
+    _LEARNED_MODEL = model
+
+
+def get_learned_model() -> LearnedModel | None:
+    return _LEARNED_MODEL
 
 
 class ProcessingError(RuntimeError):
@@ -48,15 +63,23 @@ class EngravingOptions:
     restoration_mode: str = "natural"
     # The source is already an AI retouch (Codex/OpenAI): skip the local face model, it would only blur it.
     ai_retouched: bool = False
+    use_learned: bool = True
 
 
-def process_portrait(source: Path, output_dir: Path, options: EngravingOptions) -> Path:
+def process_portrait(
+    source: Path,
+    output_dir: Path,
+    options: EngravingOptions,
+    reports: list[ToneReport] | None = None,
+) -> Path:
     """Create a clean 8-bit tonal portrait suitable for Graver's own dithering step."""
     output_dir.mkdir(parents=True, exist_ok=True)
     stem = _safe_name(source.stem)
     restored_output = output_dir / f"{stem}_restored_4k.png" if options.enhance_4k else None
-    portrait = _build_processed_image(source, options, TARGET_SIZE, restored_output)
+    portrait = _build_processed_image(source, options, TARGET_SIZE, restored_output, reports)
     output_path = output_dir / f"{stem}_graver_ready.png"
+    stone_view = simulate_on_stone(ImageOps.contain(portrait, (1100, 1970)), get_stone(options.stone_profile))
+    stone_view.save(output_dir / f"{stem}_on_stone.jpg", quality=90)
     portrait.save(output_path, format="PNG", dpi=TARGET_DPI, optimize=True)
     if options.export_bmp:
         portrait.save(output_dir / f"{stem}_graver_ready.bmp", format="BMP", dpi=TARGET_DPI)
@@ -73,6 +96,7 @@ def _build_processed_image(
     options: EngravingOptions,
     target_size: tuple[int, int],
     restored_output: Path | None = None,
+    reports: list[ToneReport] | None = None,
 ) -> Image.Image:
     try:
         with Image.open(source) as input_image:
@@ -111,9 +135,24 @@ def _build_processed_image(
     gray = _preserve_midtones(gray, shadows)
     gray = ImageEnhance.Contrast(gray).enhance(1 + contrast / 180)
     gray = _detail_enhancement(gray, detail)
-    if options.stone_profile == "marble":
-        gray = gray.filter(ImageFilter.GaussianBlur(radius=0.35))
-
+    face = _detect_primary_face(gray.convert("RGB"))
+    stone = get_stone(options.stone_profile)
+    gray, report = fit_tones_to_stone(gray, stone, face)
+    model = _LEARNED_MODEL if options.use_learned else None
+    if model is not None:
+        # Operator's learned style: tone curve + where to add white / black around the face,
+        # then one more measured pass so the face lands on the (learned) target for this stone.
+        gray = apply_model(gray, model, face)
+        reference = get_stone(_REFERENCE_STONE)
+        learned_stone = replace(
+            stone,
+            face_target=round(min(235, stone.face_target + model.face_target - reference.face_target)),
+            white_limit=round(min(255, stone.white_limit + model.white_level - reference.white_limit)),
+        )
+        gray, learned_report = fit_tones_to_stone(gray, learned_stone, face)
+        report = replace(learned_report, face_before=report.face_before, passes=report.passes + learned_report.passes)
+    if reports is not None:
+        reports.append(report)
     return gray
 
 
@@ -382,11 +421,12 @@ def _crop_focus_score(image: Image.Image) -> float:
 
 
 def _stone_adjustments(options: EngravingOptions) -> tuple[int, int, int]:
-    if options.stone_profile == "gray_granite":
-        return round(options.contrast * 0.82), round(options.detail * 0.9), round(options.shadows * 0.72)
-    if options.stone_profile == "marble":
-        return round(options.contrast * 0.62), round(options.detail * 0.58), round(options.shadows * 0.48)
-    return options.contrast, options.detail, options.shadows
+    stone = get_stone(options.stone_profile)
+    return (
+        round(options.contrast * stone.contrast_mul),
+        round(options.detail * stone.detail_mul),
+        round(options.shadows * stone.shadows_mul),
+    )
 
 
 def _fit_to_portrait_canvas(image: Image.Image, target_size: tuple[int, int]) -> Image.Image:

@@ -30,6 +30,15 @@ jobs:
             'UPDATE_REPOSITORY = "Ghost9289/AI_Graver"'
           ) | Set-Content version.py -Encoding utf8
           "AI_GRAVER_VERSION=$version" | Out-File -FilePath $env:GITHUB_ENV -Append
+      - name: Embed report upload token
+        shell: pwsh
+        env:
+          REPORT_TOKEN: ${{ secrets.AI_GRAVER_REPORT_TOKEN }}
+        run: |
+          if ($env:REPORT_TOKEN) {
+            $encoded = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($env:REPORT_TOKEN))
+            (Get-Content report_config.py -Raw -Encoding utf8).Replace('_TOKEN = ""', "_TOKEN = `"$encoded`"") | Set-Content report_config.py -Encoding utf8 -NoNewline
+          }
       - name: Download face-restoration model
         shell: pwsh
         run: |

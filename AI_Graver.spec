@@ -19,6 +19,7 @@ a = Analysis(
         ('models/GFPGANv1.4.onnx', 'models'),
         ('models/FSRCNN_x4.pb', 'models'),
         ('models/face_detection_yunet_2023mar.onnx', 'models'),
+        ('learned_default.json', '.'),
         (str(face_cascade), 'cv2/data'),
     ],
     hiddenimports=[
